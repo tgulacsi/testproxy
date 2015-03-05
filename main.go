@@ -21,12 +21,15 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"sync/atomic"
 	"time"
 
+	"github.com/tgulacsi/go/loghlp"
 	"gopkg.in/inconshreveable/log15.v2"
 )
 
@@ -73,7 +76,7 @@ func main() {
 var _ = http.Handler(&dualServer{})
 
 type dualServer struct {
-	primary, secondary *http.Client
+	primary, secondary http.Handler
 	dir                string
 	id                 uint32
 }
@@ -81,143 +84,133 @@ type dualServer struct {
 var timeout = 5 * time.Minute
 
 func newDualServer(dir, primary, secondary string) *dualServer {
+	lgr := loghlp.AsStdLog(Log.New(""), log15.LvlError)
 	tr := http.Transport{MaxIdleConnsPerHost: 4, ResponseHeaderTimeout: 30 * time.Second}
+	priURL, err := url.Parse(primary)
+	if err != nil {
+		panic(err)
+	}
+	secURL, err := url.Parse(secondary)
+	if err != nil {
+		panic(err)
+	}
+	pri := httputil.NewSingleHostReverseProxy(priURL)
+	pri.Transport, pri.ErrorLog = &tr, lgr
+	sec := httputil.NewSingleHostReverseProxy(secURL)
+	sec.Transport, sec.ErrorLog = &tr, lgr
 	return &dualServer{
 		dir:       dir,
-		primary:   &http.Client{Timeout: timeout, Transport: &tr},
-		secondary: &http.Client{Timeout: timeout, Transport: &tr},
+		primary:   pri,
+		secondary: sec,
 	}
 }
 
 func (ds *dualServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// TODO(tgulacsi): save just the headers and return a TeeWriter body.
-	readReq, saveResp, err := ds.saveRequestResponse(r)
+	requests, respWriters, err := ds.saveRequestResponse(r, 2)
 	if err != nil {
 		Log.Crit("error saving request", "error", err)
 		http.Error(w, fmt.Sprintf("error saving request: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	if r, err = readReq(); err != nil {
-		Log.Error("error reading request", "error", err)
-		http.Error(w, fmt.Sprintf("error reading request: %v", err), http.StatusInternalServerError)
-		return
-	}
-	r.RequestURI = ""
-	resp1, err := ds.primary.Do(r)
-	if err != nil {
-		Log.Error("call primary", "error", err)
-		http.Error(w, fmt.Sprintf("call primary: %v", err), http.StatusInternalServerError)
-		return
-	}
-	go func(sc int) {
-		if r, err = readReq(); err != nil {
-			Log.Error("error reading request (2.)", "error", err)
-			return
+	respWriters[0].w = w
+	defer respWriters[0].WriteCloser.Close()
+
+	Log.Debug("request 1", "req", requests[0])
+	ds.primary.ServeHTTP(respWriters[0], requests[0])
+	go func(w *respWriter, r *http.Request, sc int) {
+		defer w.WriteCloser.Close()
+		ds.secondary.ServeHTTP(w, r)
+		if w.status != sc {
+			Log.Error("CODE mismatch", "wanted", sc, "got", w.status)
 		}
-		resp2, err := ds.secondary.Do(r)
-		if err != nil {
-			Log.Error("call secondary", "error", err)
-			return
-		}
-		if _, err = saveResp(resp2, 2); err != nil {
-			Log.Error("save secondary response", "error", err)
-			return
-		}
-
-		if resp2.StatusCode != sc {
-			Log.Warn("status code mismatch", "primary", sc, "secondary", resp2.StatusCode)
-		}
-	}(resp1.StatusCode)
-
-	// TODO(tgulacsi): save just the headers and return a TeeWriter body.
-	resp, err := saveResp(resp1, 1)
-	if err != nil {
-		Log.Error("save response1", "error", err)
-		resp = resp1
-	}
-
-	// answer
-	h := w.Header()
-	for k, v := range resp.Header {
-		h[k] = v
-	}
-	w.WriteHeader(resp.StatusCode)
-
-	if _, err = io.Copy(w, resp.Body); err != nil {
-		Log.Error("writing response", "error", err)
-	}
-
+	}(respWriters[1], requests[1], respWriters[0].status)
 }
 
-func (ds *dualServer) saveRequestResponse(r *http.Request) (func() (*http.Request, error), func(*http.Response, int) (*http.Response, error), error) {
+func (ds *dualServer) saveRequestResponse(r *http.Request, n int) ([]*http.Request, []*respWriter, error) {
 	id := ds.nextID()
 	base := filepath.Join(ds.dir, fmt.Sprintf("%09d", id))
-	saveReq, err := saveRequest(base+".0", r)
-	if err != nil {
+	reqFn := base + ".0"
+	if err := writeRequest(reqFn, r); err != nil {
 		return nil, nil, err
 	}
-	return saveReq, func(resp *http.Response, n int) (*http.Response, error) {
-		if n <= 0 {
-			panic("n must be bigger than zero!")
+	requests := make([]*http.Request, n)
+	respWriters := make([]*respWriter, n)
+	for i := range requests {
+		fh, err := os.Open(reqFn)
+		if err != nil {
+			return requests, respWriters, err
 		}
-		return saveResponse(base+fmt.Sprintf(".%d", n), resp)
-	}, nil
+		if requests[i], err = http.ReadRequest(bufio.NewReader(fh)); err != nil {
+			return requests, respWriters, err
+		}
+		requests[i].Body = struct {
+			io.Reader
+			io.Closer
+		}{requests[i].Body, multiCloser{[]io.Closer{requests[i].Body, fh}}}
+
+		respWriters[i] = new(respWriter)
+		if respWriters[i].WriteCloser, err = os.Create(
+			base + fmt.Sprintf(".%d", i+1),
+		); err != nil {
+			return requests, respWriters, err
+		}
+	}
+
+	return requests, respWriters, nil
 }
 
-func saveResponse(dest string, resp *http.Response) (*http.Response, error) {
-	fh, err := os.Create(dest)
-	if err != nil {
-		return resp, err
-	}
-	if err = resp.Write(fh); err != nil {
-		_ = fh.Close()
-		return nil, err
-	}
-	if _, err = fh.Seek(0, 0); err != nil {
-		_ = fh.Close()
-		return nil, err
-	}
-	resp, err = http.ReadResponse(bufio.NewReader(fh), nil)
-	if err != nil {
-		_ = fh.Close()
-		return resp, err
-	}
-	resp.Body = struct {
-		io.Reader
-		io.Closer
-	}{resp.Body, multiCloser{[]io.Closer{resp.Body, fh}}}
-	return resp, nil
+var _ = http.ResponseWriter(&respWriter{})
+
+type respWriter struct {
+	io.WriteCloser
+	w      http.ResponseWriter
+	h      http.Header
+	status int
 }
 
-func saveRequest(dest string, r *http.Request) (func() (*http.Request, error), error) {
+func (w *respWriter) Header() http.Header {
+	if w.w != nil {
+		return w.w.Header()
+	}
+	if w.h == nil {
+		w.h = make(http.Header, 8)
+	}
+	return w.h
+}
+func (w *respWriter) WriteHeader(status int) {
+	w.status = status
+	if w.w != nil {
+		w.w.WriteHeader(status)
+	}
+	fmt.Fprintf(w.WriteCloser, "HTTP/1.1 %d %s\r\n", status, http.StatusText(status))
+	for k, v := range w.Header() {
+		fmt.Fprintf(w.WriteCloser, "%s: %s\r\n", k, v)
+	}
+	io.WriteString(w.WriteCloser, "\r\n")
+}
+func (w respWriter) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	if w.w != nil {
+		n, err := w.w.Write(p)
+		w.WriteCloser.Write(p)
+		return n, err
+	}
+	return w.WriteCloser.Write(p)
+}
+
+func writeRequest(dest string, r *http.Request) error {
 	fh, err := os.Create(dest)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if err = r.Write(fh); err != nil {
 		_ = fh.Close()
-		return nil, err
+		return err
 	}
-	if err = fh.Close(); err != nil {
-		return nil, err
-	}
-	nm := fh.Name()
-	return func() (*http.Request, error) {
-		fh, err := os.Open(nm)
-		if err != nil {
-			return nil, err
-		}
-		req, err := http.ReadRequest(bufio.NewReader(fh))
-		if err != nil {
-			return req, err
-		}
-		req.Body = struct {
-			io.Reader
-			io.Closer
-		}{req.Body, multiCloser{[]io.Closer{req.Body, fh}}}
-		return req, nil
-	}, nil
+	return fh.Close()
 }
 
 func (ds *dualServer) nextID() uint32 {
