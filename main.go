@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -84,7 +85,7 @@ type dualServer struct {
 var timeout = 5 * time.Minute
 
 func newDualServer(dir, primary, secondary string) *dualServer {
-	lgr := loghlp.AsStdLog(Log.New(""), log15.LvlError)
+	lgr := loghlp.AsStdLog(Log.New(), log15.LvlError)
 	tr := http.Transport{MaxIdleConnsPerHost: 4, ResponseHeaderTimeout: 30 * time.Second}
 	priURL, err := url.Parse(primary)
 	if err != nil {
@@ -123,6 +124,12 @@ func (ds *dualServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ds.secondary.ServeHTTP(w, r)
 		if w.status != sc {
 			Log.Error("CODE mismatch", "wanted", sc, "got", w.status)
+		} else {
+			base := w.WriteCloser.(*os.File).Name()
+			base = base[:len(base)-1]
+			for i := 0; i < 3; i++ {
+				_ = os.Remove(base + strconv.Itoa(i))
+			}
 		}
 	}(respWriters[1], requests[1], respWriters[0].status)
 }
@@ -184,8 +191,10 @@ func (w *respWriter) WriteHeader(status int) {
 		w.w.WriteHeader(status)
 	}
 	fmt.Fprintf(w.WriteCloser, "HTTP/1.1 %d %s\r\n", status, http.StatusText(status))
-	for k, v := range w.Header() {
-		fmt.Fprintf(w.WriteCloser, "%s: %s\r\n", k, v)
+	for k, vv := range w.Header() {
+		for _, v := range vv {
+			fmt.Fprintf(w.WriteCloser, "%s: %s\r\n", k, v)
+		}
 	}
 	io.WriteString(w.WriteCloser, "\r\n")
 }
