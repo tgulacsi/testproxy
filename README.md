@@ -7,7 +7,7 @@ If the status code's differ, then the request and both responses are logged
 to three files under a subdir.
 
 
-## Ratinale
+## Rationale
 I want to rewrite my Python server in Go, but this is mission-critical service,
 so the rewrite must be as good as possible. And it has to mimic the quirks of
 the legacy app...
