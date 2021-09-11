@@ -28,6 +28,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/tgulacsi/go/loghlp"
@@ -60,13 +61,17 @@ func main() {
 	}
 	sl := newStoppableListener(l)
 	ch := make(chan os.Signal)
-	signal.Notify(ch, os.Interrupt)
+	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
 	go func() {
-		<-ch
+		sig := <-ch
 		Log.Warn("Got SIGINT exiting")
 		sl.Add(1)
 		sl.Close()
 		sl.Done()
+		if p, _ := os.FindProcess(os.Getpid()); p != nil {
+			time.Sleep(time.Second)
+			_ = p.Signal(sig)
+		}
 	}()
 	Log.Info("Starting Proxy, listening on " + *flagHTTP)
 	http.Serve(sl, newDualServer(*flagDir, flag.Arg(0), flag.Arg(1)))
